@@ -134,6 +134,10 @@ struct clip_hparams {
     int32_t custom_image_min_tokens = -1;
     int32_t custom_image_max_tokens = -1;
 
+    // visual token pruning (CLS-attention based)
+    float visual_keep = 1.0f;
+    std::string visual_prune_method = "none";
+
     void set_limit_image_tokens(int n_tokens_min, int n_tokens_max) {
         const int patch_area = patch_size * patch_size * n_merge * n_merge;
         image_min_pixels = (custom_image_min_tokens > 0 ? custom_image_min_tokens : n_tokens_min) * patch_area;

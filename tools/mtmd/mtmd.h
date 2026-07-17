@@ -99,6 +99,10 @@ struct mtmd_context_params {
     int image_min_tokens; // minimum number of tokens for image input (default: read from metadata)
     int image_max_tokens; // maximum number of tokens for image input (default: read from metadata)
 
+    // visual token pruning (CLS-attention based, CLIP-family vision encoders only)
+    float visual_keep; // fraction of visual tokens to keep after pruning, (0.0, 1.0] (default: 1.0, disabled)
+    const char * visual_prune_method; // pruning method: "none" (default) or "cls"
+
     // callback function passed over to mtmd proper
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

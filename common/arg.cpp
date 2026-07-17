@@ -2387,6 +2387,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
     add_opt(common_arg(
+        {"--visual-keep"}, "N",
+        "fraction of visual tokens to keep after pruning, in (0.0, 1.0] (default: 1.0, disabled)",
+        [](common_params & params, const std::string & value) {
+            float keep = std::stof(value);
+            if (keep <= 0.0f || keep > 1.0f) {
+                throw std::invalid_argument(string_format("error: --visual-keep must be in (0.0, 1.0], got %s", value.c_str()));
+            }
+            params.visual_keep = keep;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VISUAL_KEEP"));
+    add_opt(common_arg(
+        {"--visual-prune-method"}, "METHOD",
+        "visual token pruning method to use when --visual-keep < 1.0 (default: none; valid: cls)",
+        [](common_params & params, const std::string & value) {
+            if (value != "none" && value != "cls") {
+                throw std::invalid_argument(string_format("error: --visual-prune-method must be one of: none, cls; got %s", value.c_str()));
+            }
+            params.visual_prune_method = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VISUAL_PRUNE_METHOD"));
+    add_opt(common_arg(
         {"--mtmd-batch-max-tokens"}, "N",
         string_format("maximum number of image tokens per batch when encoding images (default: %d)", params.mtmd_batch_max_tokens),
         [](common_params & params, int value) {

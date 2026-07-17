@@ -209,6 +209,10 @@ struct clip_ctx {
         if (ctx_params.image_max_tokens > 0) {
             model.hparams.custom_image_max_tokens = ctx_params.image_max_tokens;
         }
+        model.hparams.visual_keep = ctx_params.visual_keep;
+        if (ctx_params.visual_prune_method != nullptr) {
+            model.hparams.visual_prune_method = ctx_params.visual_prune_method;
+        }
 
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
@@ -3304,6 +3308,16 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
 
     switch (proj) {
         case PROJECTOR_TYPE_MLP:
+            {
+                // visual token pruning: matches the K computed by clip_graph_llava::build()
+                // (llava.cpp) under the identical condition; must stay in agreement or the
+                // n_tokens_out sanity check below aborts.
+                if (params.visual_keep < 1.0f &&
+                    params.visual_prune_method == "cls" &&
+                    ctx->model.class_embedding != nullptr) {
+                    n_patches = std::max(1, (int) std::round(n_patches * params.visual_keep));
+                }
+            } break;
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_PHI4:
@@ -4098,15 +4112,27 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
                 }
                 set_input_i32("positions", positions);
 
-                // The patches vector is used to get rows to index into the embeds with;
-                // we should skip dim 0 only if we have CLS to avoid going out of bounds
-                // when retrieving the rows.
-                int patch_offset = model.class_embedding ? 1 : 0;
-                std::vector<int32_t> patches(num_patches);
-                for (int i = 0; i < num_patches; i++) {
-                    patches[i] = i + patch_offset;
+                // Visual token pruning: same condition as clip_graph_llava::build()
+                // (llava.cpp). When active, the graph has no "patches" input tensor
+                // at all (it computes its gather indices in-graph instead), so filling
+                // it here would abort in get_inp_tensor's GGML_ABORT.
+                const bool prune_visual_tokens =
+                    hparams.visual_keep < 1.0f &&
+                    hparams.visual_prune_method == "cls" &&
+                    model.class_embedding != nullptr &&
+                    model.proj_type == PROJECTOR_TYPE_MLP;
+
+                if (!prune_visual_tokens) {
+                    // The patches vector is used to get rows to index into the embeds with;
+                    // we should skip dim 0 only if we have CLS to avoid going out of bounds
+                    // when retrieving the rows.
+                    int patch_offset = model.class_embedding ? 1 : 0;
+                    std::vector<int32_t> patches(num_patches);
+                    for (int i = 0; i < num_patches; i++) {
+                        patches[i] = i + patch_offset;
+                    }
+                    set_input_i32("patches", patches);
                 }
-                set_input_i32("patches", patches);
             } break;
         case PROJECTOR_TYPE_GEMMA4V:
         case PROJECTOR_TYPE_GEMMA4UV:

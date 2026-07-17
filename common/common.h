@@ -598,6 +598,8 @@ struct common_params {
     std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
+    float visual_keep = 1.0f;                 // fraction of visual tokens to keep after pruning, (0.0, 1.0] (default: 1.0, disabled)
+    std::string visual_prune_method = "none"; // visual token pruning method: "none" or "cls"
     int mtmd_batch_max_tokens = 1024;
 
     // finetune

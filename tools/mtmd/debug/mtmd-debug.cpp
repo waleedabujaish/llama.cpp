@@ -90,6 +90,8 @@ int main(int argc, char ** argv) {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.visual_keep         = params.visual_keep;
+        mparams.visual_prune_method = params.visual_prune_method.c_str();
         {
             // always enable debug callback
             mparams.cb_eval_user_data = &cb_data;

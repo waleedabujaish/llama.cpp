@@ -23,6 +23,15 @@ ggml_cgraph * clip_graph_llava::build() {
         max_feature_layer = deepest_feature_layer < 0 ? il_last : deepest_feature_layer;
     }
 
+    // visual token pruning (FasterVLM-style CLS-attention scoring), CLIP-family only.
+    // visual_prune_method gates on top of visual_keep so future non-"cls" methods
+    // don't silently activate this branch once they're added.
+    const bool prune_visual_tokens =
+        hparams.visual_keep < 1.0f &&
+        hparams.visual_prune_method == "cls" &&
+        model.class_embedding != nullptr &&
+        proj_type == PROJECTOR_TYPE_MLP;
+
     ggml_tensor * inp = build_inp();
 
     // concat class_embeddings and patch_embeddings
@@ -45,6 +54,11 @@ ggml_cgraph * clip_graph_llava::build() {
     }
 
     std::vector<ggml_tensor *> embedding_stack;
+
+    // [n_patches] mean CLS-attention score per patch, set at the scoring layer
+    // below when prune_visual_tokens is active; consumed by the top-K gather
+    // that replaces the "patches" input further down.
+    ggml_tensor * cls_scores = nullptr;
 
     // loop over layers
     for (int il = 0; il < max_feature_layer; il++) {
@@ -89,6 +103,35 @@ ggml_cgraph * clip_graph_llava::build() {
             cur = build_attn(layer.o_w, layer.o_b,
                 Qcur, Kcur, Vcur, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
+
+            // CLS-attention scoring branch: independent of the main attention
+            // above, reuses the same Qcur/Kcur. Only built at the scoring layer
+            // (the last built layer) and only when pruning is active.
+            if (prune_visual_tokens && il == max_feature_layer - 1) {
+                // CLS query only: row 0 of Qcur [d_head, n_head, n_pos]
+                ggml_tensor * q_cls = ggml_view_3d(ctx0, Qcur, d_head, n_head, 1, Qcur->nb[1], Qcur->nb[2], 0);
+                q_cls = ggml_permute(ctx0, q_cls, 0, 2, 1, 3); // -> [d_head, 1, n_head]
+                ggml_tensor * k_perm = ggml_permute(ctx0, Kcur, 0, 2, 1, 3); // -> [d_head, n_pos, n_head]
+
+                // raw scores, all heads, one query -> [n_pos, 1, n_head]
+                ggml_tensor * scores = ggml_mul_mat(ctx0, k_perm, q_cls);
+                // softmax over all n_pos keys (CLS included), matching FasterVLM's
+                // attentions[-2][:, :, 0, :] before its [1:] slice below
+                scores = ggml_soft_max_ext(ctx0, scores, nullptr, kq_scale, 0.0f);
+
+                // drop the CLS-self entry (key position 0) post-softmax; pre-softmax
+                // exclusion would rescale each head's remaining probs by a different
+                // per-head constant and silently change the cross-head-averaged ranking
+                ggml_tensor * scores_patches = ggml_view_3d(ctx0, scores, n_patches, 1, n_head,
+                    scores->nb[1], scores->nb[2], scores->nb[0]); // -> [n_patches, 1, n_head]
+
+                // mean over heads: bring n_head to axis 0 (ggml_mean/ggml_sum_rows
+                // require unit stride on the reduced axis, hence the ggml_cont)
+                ggml_tensor * scores_by_head = ggml_cont(ctx0, ggml_permute(ctx0, scores_patches, 1, 2, 0, 3));
+                cls_scores = ggml_mean(ctx0, scores_by_head); // -> [1, n_patches]
+                cls_scores = ggml_reshape_1d(ctx0, cls_scores, n_patches);
+                cb(cls_scores, "cls_scores", il);
+            }
         }
 
         // re-add the layer input, e.g., residual
@@ -145,13 +188,37 @@ ggml_cgraph * clip_graph_llava::build() {
     if (hparams.has_llava_projector) {
         embeddings = ggml_reshape_2d(ctx0, embeddings, embeddings->ne[0], embeddings->ne[1]);
 
-        ggml_tensor * patches = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
-        ggml_set_name(patches, "patches");
-        ggml_set_input(patches);
+        if (prune_visual_tokens) {
+            // Visual token pruning: top-K patches by mean CLS-attention score,
+            // replacing the "patches" input gather below. clip_n_output_tokens
+            // (clip.cpp) computes the matching K, and clip_image_batch_encode
+            // (clip.cpp) skips the "patches" input fill under the same condition
+            // as prune_visual_tokens above -- all three must stay in agreement.
+            GGML_ASSERT(cls_scores != nullptr);
+            const int K = std::max(1, (int) std::round(n_patches * hparams.visual_keep));
 
-        // shape [1, 576, 1024]
-        // ne is whcn, ne = [1024, 576, 1, 1]
-        embeddings = ggml_get_rows(ctx0, embeddings, patches);
+            // top-K patch-space indices (0..n_patches-1), descending by score
+            ggml_tensor * kept_desc = ggml_argsort_top_k(ctx0, cls_scores, K);
+
+            // restore spatial (ascending patch-index) order within the kept set
+            ggml_tensor * kept_desc_f32 = ggml_cast(ctx0, kept_desc, GGML_TYPE_F32);
+            ggml_tensor * perm = ggml_argsort(ctx0, kept_desc_f32, GGML_SORT_ORDER_ASC);
+
+            // row-offset view skipping the CLS row (row 0); patch i lives at row i+1
+            ggml_tensor * patch_rows = ggml_view_2d(ctx0, embeddings, n_embd, n_patches,
+                embeddings->nb[1], embeddings->nb[1]);
+
+            ggml_tensor * picked = ggml_get_rows(ctx0, patch_rows, kept_desc); // [n_embd, K], score order
+            embeddings = ggml_get_rows(ctx0, picked, perm); // [n_embd, K], ascending spatial order
+        } else {
+            ggml_tensor * patches = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+            ggml_set_name(patches, "patches");
+            ggml_set_input(patches);
+
+            // shape [1, 576, 1024]
+            // ne is whcn, ne = [1024, 576, 1, 1]
+            embeddings = ggml_get_rows(ctx0, embeddings, patches);
+        }
 
         // print_tensor_info(embeddings, "embeddings");
 
